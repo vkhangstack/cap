@@ -43,14 +43,13 @@ if (ADMIN_KEY.length < 20) {
 
 let keys = [];
 const capInstances = new Map();
+let cacheAuth = {};
 
 const updateCache = async () => {
   let cacheConfig = {};
 
   try {
-    cacheConfig = JSON.parse(
-      await fs.readFile(path.join(dataDir, "assets-cache.json"), "utf-8")
-    );
+    cacheConfig = JSON.parse(await fs.readFile(path.join(dataDir, "assets-cache.json"), "utf-8"));
   } catch {}
 
   const lastUpdate = cacheConfig["lastUpdate"] || 0;
@@ -60,48 +59,82 @@ const updateCache = async () => {
   if (!(currentTime - lastUpdate > updateInterval)) return;
 
   try {
-    const [widgetSource, floatingSource, wasmSource, wasmLoaderSource] =
-      await Promise.all([
-        fetch("https://cdn.jsdelivr.net/npm/@cap.js/widget@latest").then((r) =>
-          r.text()
-        ),
-        fetch(
-          "https://cdn.jsdelivr.net/npm/@cap.js/widget/cap-floating.min.js"
-        ).then((r) => r.text()),
-        fetch(
-          "https://cdn.jsdelivr.net/npm/@cap.js/wasm/browser/cap_wasm_bg.wasm"
-        ).then((r) => r.arrayBuffer()),
-        fetch(
-          "https://cdn.jsdelivr.net/npm/@cap.js/wasm/browser/cap_wasm.min.js"
-        ).then((r) => r.text()),
-      ]);
+    const [widgetSource, floatingSource, wasmSource, wasmLoaderSource] = await Promise.all([
+      fetch("https://cdn.jsdelivr.net/npm/@cap.js/widget@latest").then((r) => r.text()),
+      fetch("https://cdn.jsdelivr.net/npm/@cap.js/widget/cap-floating.min.js").then((r) => r.text()),
+      fetch("https://cdn.jsdelivr.net/npm/@cap.js/wasm/browser/cap_wasm_bg.wasm").then((r) => r.arrayBuffer()),
+      fetch("https://cdn.jsdelivr.net/npm/@cap.js/wasm/browser/cap_wasm.min.js").then((r) => r.text()),
+    ]);
 
     cacheConfig["lastUpdate"] = currentTime;
-    await fs.writeFile(
-      path.join(dataDir, "assets-cache.json"),
-      JSON.stringify(cacheConfig)
-    );
+    await fs.writeFile(path.join(dataDir, "assets-cache.json"), JSON.stringify(cacheConfig));
 
     await fs.writeFile(path.join(dataDir, "assets-widget.js"), widgetSource);
-    await fs.writeFile(
-      path.join(dataDir, "assets-floating.js"),
-      floatingSource
-    );
-    await fs.writeFile(
-      path.join(dataDir, "assets-cap_wasm_bg.wasm"),
-      Buffer.from(wasmSource)
-    );
-    await fs.writeFile(
-      path.join(dataDir, "assets-cap_wasm.js"),
-      wasmLoaderSource
-    );
-
-    console.log("[asset server] updated assets cache");
+    await fs.writeFile(path.join(dataDir, "assets-floating.js"), floatingSource);
+    await fs.writeFile(path.join(dataDir, "assets-cap_wasm_bg.wasm"), Buffer.from(wasmSource));
+    await fs.writeFile(path.join(dataDir, "assets-cap_wasm.js"), wasmLoaderSource);
   } catch (e) {
-    console.error(
-      "[asset server] error updating assets cache, trying to load them might fail:",
-      e
-    );
+    console.error("[asset server] error updating assets cache, trying to load them might fail:", e);
+  }
+};
+
+const initBasicAuth = async () => {
+  try {
+    const authFilePath = path.join(dataDir, "basic-auth.json");
+
+    const base64 = process.env.BASIC_AUTH?.trim();
+    if (!base64) {
+      // console.warn("BASIC_AUTH environment variable is not set, basic auth will not be initialized.");
+      return;
+    }
+    const decoded = Buffer.from(base64, "base64").toString("utf-8");
+    const [username, password] = decoded.split(":");
+    if (!username || !password) {
+      // console.warn("BASIC_AUTH environment variable is not properly formatted, basic auth will not be initialized.");
+      return;
+    }
+    cacheAuth["username"] = username;
+    cacheAuth["password"] = password;
+
+    await fs.writeFile(authFilePath, JSON.stringify({ username, password }));
+  } catch (error) {
+    console.error("Error initializing basic auth:", error);
+  }
+};
+
+const isVerifyBasicAuthEnabled = () => {
+  return Boolean(process.env.BASIC_AUTH?.trim());
+};
+
+const verifyBasicAuth = async (headers, set) => {
+  const authFilePath = path.join(dataDir, "basic-auth.json");
+
+  if (!cacheAuth["username"] || !cacheAuth["password"]) {
+    cacheAuth = JSON.parse(await fs.readFile(authFilePath, "utf-8"));
+  }
+
+  try {
+    const authHeader = headers["authorization"];
+
+    if (!authHeader || !authHeader.startsWith("Basic ")) {
+      set.status = 401;
+      set.headers["WWW-Authenticate"] = 'Basic realm="CAP.js Admin"';
+      return false;
+    }
+    const base64Credentials = authHeader.split(" ")[1];
+    const credentials = Buffer.from(base64Credentials, "base64").toString("utf-8");
+    const [username, password] = credentials.split(":");
+    if (username !== cacheAuth["username"] || password !== cacheAuth["password"]) {
+      set.status = 401;
+      set.headers["WWW-Authenticate"] = 'Basic realm="CAP.js Admin"';
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Error verifying basic auth:", error);
+    set.status = 500;
+    return false;
   }
 };
 
@@ -201,13 +234,7 @@ const internal = new Elysia({ prefix: "/internal" })
   .post(
     "/createKey",
     async ({
-      body: {
-        keyName,
-        challengesCount = 18,
-        challengeSize = 32,
-        challengeDifficulty = 4,
-        expiresMs = 600000,
-      },
+      body: { keyName, challengesCount = 18, challengeSize = 32, challengeDifficulty = 4, expiresMs = 600000 },
       set,
     }) => {
       if (!keyName?.trim()) {
@@ -244,17 +271,7 @@ const internal = new Elysia({ prefix: "/internal" })
   )
   .post(
     "/editKey",
-    async ({
-      body: {
-        publicKey,
-        keyName,
-        challengesCount,
-        challengeSize,
-        challengeDifficulty,
-        expiresMs,
-      },
-      set,
-    }) => {
+    async ({ body: { publicKey, keyName, challengesCount, challengeSize, challengeDifficulty, expiresMs }, set }) => {
       const keyIndex = keys.findIndex((key) => key.publicKey === publicKey);
 
       if (keyIndex === -1) {
@@ -303,10 +320,7 @@ const internal = new Elysia({ prefix: "/internal" })
       await fs.unlink(tokenFilePath);
     } catch (error) {
       if (error.code !== "ENOENT") {
-        console.warn(
-          `Could not delete token file ${tokenFilePath}:`,
-          error.message
-        );
+        console.warn(`Could not delete token file ${tokenFilePath}:`, error.message);
       }
     }
 
@@ -339,13 +353,13 @@ const api = new Elysia({ prefix: "/:key" })
       origin: process.env.CORS_ORIGIN || true,
     })
   )
-  .use(
-    rateLimit({
-      scoping: "scoped",
-      number: 80,
-      duration: 1000,
-    })
-  )
+  // .use(
+  //   rateLimit({
+  //     scoping: "scoped",
+  //     number: 80,
+  //     duration: 1000,
+  //   })
+  // )
   .derive(({ params }) => {
     const keyData = keys.find((k) => k.publicKey === params.key);
     if (!keyData) {
@@ -371,8 +385,16 @@ const api = new Elysia({ prefix: "/:key" })
 
     return await capInstance.redeemChallenge({ token, solutions });
   })
-  .post("/siteverify", async ({ body, set, keyData, capInstance }) => {
+  .post("/siteverify", async ({ body, set, keyData, capInstance, headers }) => {
     const { secret, response } = body;
+
+    if (isVerifyBasicAuthEnabled()) {
+      const verify = await verifyBasicAuth(headers, set);
+
+      if (!verify) {
+        return { success: false, message: "Unauthorized" };
+      }
+    }
 
     if (!secret || !response) {
       set.status = 400;
@@ -385,7 +407,7 @@ const api = new Elysia({ prefix: "/:key" })
     }
 
     return await capInstance.validateToken(response, {
-      keepToken: false
+      keepToken: false,
     });
   });
 
@@ -415,12 +437,11 @@ new Elysia()
   .use(assetsServer)
   .get("/", async ({ cookie }) => {
     const authCookie = cookie["cap-admin-key"]?.value;
-    const isAuthed =
-      authCookie && (await Bun.password.verify(ADMIN_KEY, authCookie));
+    const isAuthed = authCookie && (await Bun.password.verify(ADMIN_KEY, authCookie));
 
     return file(isAuthed ? "./public/index.html" : "./public/lock.html");
   })
   .listen(3000);
 
-console.log(`Cap standalone running on http://localhost:3000`);
 init();
+initBasicAuth();
