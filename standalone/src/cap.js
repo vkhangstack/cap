@@ -2,16 +2,13 @@ import { Elysia } from "elysia";
 import Cap from "@cap.js/server";
 import { cors } from "@elysiajs/cors";
 import { rateLimit } from "elysia-rate-limit";
-
 import { db } from "./db.js";
 import { ratelimitGenerator } from "./ratelimit.js";
+import { join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 
-const getSitekeyConfigQuery = db.query(
-  `SELECT (config) FROM keys WHERE siteKey = ?`
-);
-const getSitekeyWithSecretQuery = db.query(
-  `SELECT * FROM keys WHERE siteKey = ?`
-);
+const getSitekeyConfigQuery = db.query(`SELECT (config) FROM keys WHERE siteKey = ?`);
+const getSitekeyWithSecretQuery = db.query(`SELECT * FROM keys WHERE siteKey = ?`);
 
 const insertChallengeQuery = db.query(`
   INSERT INTO challenges (siteKey, token, data, expires)
@@ -41,6 +38,69 @@ const upsertSolutionQuery = db.query(`
   ON CONFLICT (siteKey, bucket)
   DO UPDATE SET count = count + 1
 `);
+
+let cacheAuth = {};
+let dataDir = "./.data";
+
+const initBasicAuth = async () => {
+  try {
+    const authFilePath = join(dataDir, "basic-auth.json");
+
+    const base64 = process.env.BASIC_AUTH?.trim();
+    if (!base64) {
+      console.warn("BASIC_AUTH environment variable is not set, basic auth will not be initialized.");
+      return;
+    }
+    const decoded = Buffer.from(base64, "base64").toString("utf-8");
+    const [username, password] = decoded.split(":");
+    if (!username || !password) {
+      console.warn("BASIC_AUTH environment variable is not properly formatted, basic auth will not be initialized.");
+      return;
+    }
+    cacheAuth["username"] = username;
+    cacheAuth["password"] = password;
+
+    writeFileSync(authFilePath, JSON.stringify({ username, password }));
+  } catch (error) {
+    console.error("Error initializing basic auth:", error);
+  }
+};
+
+const isVerifyBasicAuthEnabled = () => {
+  return Boolean(process.env.BASIC_AUTH?.trim());
+};
+
+const verifyBasicAuth = async (headers, set) => {
+  const authFilePath = join(dataDir, "basic-auth.json");
+
+  if (!cacheAuth["username"] || !cacheAuth["password"]) {
+    cacheAuth = JSON.parse(await readFileSync(authFilePath, "utf-8"));
+  }
+
+  try {
+    const authHeader = headers["authorization"];
+
+    if (!authHeader || !authHeader.startsWith("Basic ")) {
+      set.status = 401;
+      set.headers["WWW-Authenticate"] = 'Basic realm="CAP.js Admin"';
+      return false;
+    }
+    const base64Credentials = authHeader.split(" ")[1];
+    const credentials = Buffer.from(base64Credentials, "base64").toString("utf-8");
+    const [username, password] = credentials.split(":");
+    if (username !== cacheAuth["username"] || password !== cacheAuth["password"]) {
+      set.status = 401;
+      set.headers["WWW-Authenticate"] = 'Basic realm="CAP.js Admin"';
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Error verifying basic auth:", error);
+    set.status = 500;
+    return false;
+  }
+};
 
 export const capServer = new Elysia({
   detail: {
@@ -139,9 +199,17 @@ export const capServer = new Elysia({
       expires,
     };
   })
-  .post("/:siteKey/siteverify", async ({ body, set, params }) => {
+  .post("/:siteKey/siteverify", async ({ body, set, params, headers }) => {
     const sitekey = params.siteKey;
     const { secret, response } = body;
+    if (isVerifyBasicAuthEnabled()) {
+      const verify = await verifyBasicAuth(headers, set);
+
+      if (!verify) {
+        set.status = 401;
+        return { success: false, message: "Unauthorized", error: "Invalid basic auth credentials" };
+      }
+    }
 
     if (!sitekey || !secret || !response) {
       set.status = 400;
@@ -175,3 +243,5 @@ export const capServer = new Elysia({
     deleteTokenQuery.run(params.siteKey, response);
     return { success: true };
   });
+
+await initBasicAuth();
