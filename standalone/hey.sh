@@ -1,0 +1,1 @@
+hey -c 200 -n 1000 -m POST -H "Content-Type: application/json" -d {} http://localhost:3000/47982ea943/challenge

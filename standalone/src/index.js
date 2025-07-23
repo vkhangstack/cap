@@ -7,7 +7,13 @@ import { server } from "./server.js";
 import { assetsServer } from "./assets.js";
 import { capServer } from "./cap.js";
 
-new Elysia()
+new Elysia({
+  // Performance optimizations for 200 QPS
+  serve: {
+    reusePort: true,
+    maxRequestBodySize: 1024 * 1024, // 1MB limit
+  },
+})
   .use(
     swagger({
       scalarConfig: {
@@ -18,13 +24,11 @@ new Elysia()
         tags: [
           {
             name: "Keys",
-            description:
-              "Managing, creating and viewing keys. Requires API or session token",
+            description: "Managing, creating and viewing keys. Requires API or session token",
           },
           {
             name: "Settings",
-            description:
-              "Managing sessions, API keys, and other settings. Requires API or session token",
+            description: "Managing sessions, API keys, and other settings. Requires API or session token",
           },
           {
             name: "Challenges",
@@ -49,18 +53,28 @@ new Elysia()
       },
     })
   )
-  .use(staticPlugin())
-  .get("/", async ({ cookie }) => {
-    return file(
-      cookie.cap_authed?.value === "yes"
-        ? "./public/index.html"
-        : "./public/login.html"
-    );
+  .use(
+    staticPlugin({
+      // Enable static file caching
+      headers: {
+        "Cache-Control": "public, max-age=3600", // 1 hour cache
+      },
+    })
+  )
+  .get("/", async ({ cookie, set }) => {
+    // Add caching headers for better performance
+    set.headers["Cache-Control"] = "public, max-age=300"; // 5 minute cache
+
+    return file(cookie.cap_authed?.value === "yes" ? "./public/index.html" : "./public/login.html");
   })
   .use(auth)
   .use(server)
   .use(assetsServer)
   .use(capServer)
-  .listen(3000);
+  .listen({
+    port: 3000,
+    reusePort: true,
+    maxRequestBodySize: 1024 * 1024, // 1MB limit
+  });
 
 console.log(`🧢 Cap running on http://localhost:3000`);
